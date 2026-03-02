@@ -31,11 +31,21 @@ Edit:
 
 ## Commands
 - `legato current` (now playing / last scrobble)
+- `legato fm` (FMbot-style alias for current)
+- `legato disconnect` (remove saved session + username from local config)
 - `legato recent [-n N] [--user USER]`
-- `legato top artist|album|track [-p day|week|month|quarter|year|overall] [-n N]`
+- `legato top artist|album|track [-p day|week|month|quarter|year|overall|alltime|all] [--year YYYY] [-n N]`
 - `legato artist|album|track [--name ...] [--artist ...]`
+- `legato artist "ARTIST"`
+- `legato album "ARTIST | ALBUM"`
+- `legato track "ARTIST | TRACK"`
+- `legato album [--query "ARTIST | ALBUM"] [--user USER]`
+- `legato plays [--target artist|album|track] [--query "..."] [--name ...] [--artist ...] [--user USER]`
 - `legato np ARTIST TRACK [--album ...]` (update now playing)
 - `legato scrobble ARTIST TRACK [--album ...] [--ts now|UNIX]`
+- `legato scrobble "ARTIST | TRACK[ | ALBUM]" [--album ...] [--ts now|UNIX]`
+- `legato first [--query "ARTIST[ | TRACK]"] [--artist ...] [--track ...] [--user USER]`
+- `legato taste OTHER_USER [--user USER] [-p period] [-n N]`
 - `legato love [ARTIST] [TRACK]` (defaults to current)
 - `legato unlove [ARTIST] [TRACK]`
 - `legato profile [--user USER]`
@@ -50,3 +60,33 @@ Edit:
 ## Notes
 Legato aims to cover the core Last.fm functionality exposed by the official API (recent, now playing, scrobble, top, info, love/unlove, profile, friends).
 Discord-server-only features are intentionally omitted.
+
+## Publish to PyPI (GitHub Actions)
+
+This repo includes [publish workflow](.github/workflows/publish-pypi.yml) that:
+- builds package artifacts,
+- runs `twine check`,
+- publishes to PyPI when you push a tag like `v0.5.0`.
+
+### One-time setup
+1. Create a PyPI API token (scope it to this project).
+2. In GitHub: **Settings → Secrets and variables → Actions → New repository secret**.
+3. Add secret name: `PYPI_API_TOKEN`, value: your token.
+
+### Release flow
+1. Bump version in `pyproject.toml`.
+2. Commit and push.
+3. Create and push a tag:
+
+```bash
+git tag v0.5.0
+git push origin v0.5.0
+```
+
+4. Watch Actions run; after success users can install/update with:
+
+```bash
+pipx install legato
+# or
+pipx upgrade legato
+```

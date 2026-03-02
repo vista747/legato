@@ -1,13 +1,17 @@
 from __future__ import annotations
 import time
 import subprocess
+import html
+import re
 import click
 
 from .config import load_config, save_config, config_path
 from .lastfm import LastfmClient, LastfmError, validate_app_creds, period_to_lastfm
 from .utils import now_ts, human_delta, clamp, lastfm_user_url, lastfm_artist_url, lastfm_album_url, lastfm_track_url, youtube_search_url
-from .ansi import hyperlink
-from .theme import get_theme, set_accent
+from .ansi import hyperlink, sgr, reset
+from .theme import get_theme, set_accent, NAMED
+
+THEME_COLOR_NAMES = ", ".join(NAMED.keys())
 
 def eprint(msg: str) -> None:
     click.echo(msg, err=True)
@@ -27,15 +31,231 @@ def make_client() -> LastfmClient:
         username=cfg.get("username"),
     )
 
+def require_connected(lfm: LastfmClient) -> None:
+    # For commands that need a default user (like current/recent/top without --user)
+    if not lfm.username:
+        fatal("No last.fm account connected, run `legato setup` to connect your last.fm account")
+
 def accent(s: str) -> str:
     return get_theme().accentize(s)
 
 def link(text: str, url: str) -> str:
     return hyperlink(text, url)
 
+def bold(text: str) -> str:
+    return f"{sgr('1')}{text}{reset()}"
+
+def _split_csv(value: str, min_parts: int, max_parts: int, what: str) -> list[str]:
+    parts = [p.strip() for p in value.split("|")]
+    if len(parts) < min_parts or len(parts) > max_parts or any(not p for p in parts):
+        raise click.ClickException(
+            f"{what} must use '|' separators with {min_parts}..{max_parts} parts (quote the full value)"
+        )
+    return parts
+
+def _listify(items):
+    if not items:
+        return []
+    return [items] if isinstance(items, dict) else items
+
+def _recent_tracks_page(
+    lfm: LastfmClient,
+    user: str | None,
+    page: int,
+    limit: int = 200,
+    retries: int = 2,
+) -> dict | None:
+    for attempt in range(retries + 1):
+        try:
+            return lfm.recent_tracks(user=user, limit=limit, page=page)
+        except LastfmError:
+            if attempt >= retries:
+                return None
+            time.sleep(0.4 * (attempt + 1))
+    return None
+
+def _plays_text(value: str | int) -> str:
+    n = int(value)
+    return f"{n} play" if n == 1 else f"{n} plays"
+
+def _top_for_year(
+    lfm: LastfmClient,
+    user: str,
+    kind: str,
+    year: int,
+    limit: int,
+    max_pages: int = 300,
+) -> list[tuple[str, str, int]]:
+    counts: dict[tuple[str, str], int] = {}
+    page = 1
+
+    while page <= max_pages:
+        rt = _recent_tracks_page(lfm, user=user, limit=200, page=page)
+        if rt is None:
+            break
+        tracks = _listify(rt.get("track"))
+        if not tracks:
+            break
+
+        seen_older = False
+        for t in tracks:
+            if str((t.get("@attr") or {}).get("nowplaying", "")).lower() == "true":
+                continue
+            uts = (t.get("date") or {}).get("uts")
+            if not uts:
+                continue
+            ts_year = time.gmtime(int(uts)).tm_year
+            if ts_year < year:
+                seen_older = True
+                continue
+            if ts_year > year:
+                continue
+
+            artist = (t.get("artist") or {}).get("name") or (t.get("artist") or {}).get("#text") or ""
+            track = t.get("name") or ""
+            album = (t.get("album") or {}).get("#text") or ""
+
+            if kind == "artist":
+                if not artist:
+                    continue
+                key = (artist, "")
+            elif kind == "album":
+                if not artist or not album:
+                    continue
+                key = (album, artist)
+            else:
+                if not artist or not track:
+                    continue
+                key = (track, artist)
+            counts[key] = counts.get(key, 0) + 1
+
+        if seen_older:
+            break
+
+        attr = rt.get("@attr") or {}
+        total_pages_raw = attr.get("totalPages")
+        if total_pages_raw:
+            try:
+                if page >= int(total_pages_raw):
+                    break
+            except ValueError:
+                pass
+        page += 1
+
+    ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+    return [(k[0], k[1], v) for k, v in ranked]
+
+def _strip_markup(text: str) -> str:
+    no_tags = re.sub(r"<[^>]+>", "", text or "")
+    clean = html.unescape(no_tags).replace("\n", " ").strip()
+    clean = re.sub(r"\s+", " ", clean)
+    clean = re.sub(r"\s*Read more on Last\.fm\s*$", "…", clean, flags=re.IGNORECASE)
+    return clean
+
+def _entity_description(kind: str, info: dict) -> str:
+    if kind == "artist":
+        return _strip_markup(((info.get("bio") or {}).get("summary") or ""))
+    return _strip_markup(((info.get("wiki") or {}).get("summary") or ""))
+
+def _entity_recent_and_first(
+    lfm: LastfmClient,
+    user: str,
+    kind: str,
+    artist_name: str,
+    item_name: str | None,
+    recent_days: int = 30,
+    max_pages: int = 60,
+    max_seconds: float = 12.0,
+) -> tuple[int, int | None, bool]:
+    cutoff = now_ts() - recent_days * 86400
+    recent_count = 0
+    first_ts = None
+    page = 1
+    partial = False
+    started = time.time()
+
+    while page <= max_pages:
+        if time.time() - started > max_seconds:
+            partial = True
+            break
+        rt = _recent_tracks_page(lfm, user=user, limit=200, page=page)
+        if rt is None:
+            partial = True
+            break
+        tracks = _listify(rt.get("track"))
+        if not tracks:
+            break
+
+        for t in tracks:
+            if str((t.get("@attr") or {}).get("nowplaying", "")).lower() == "true":
+                continue
+            cur_artist = (t.get("artist") or {}).get("name") or (t.get("artist") or {}).get("#text") or ""
+            cur_track = t.get("name") or ""
+            cur_album = (t.get("album") or {}).get("#text") or ""
+            if kind == "artist":
+                is_match = cur_artist.casefold() == artist_name.casefold()
+            elif kind == "album":
+                is_match = (
+                    cur_artist.casefold() == artist_name.casefold()
+                    and (item_name or "").casefold() == cur_album.casefold()
+                )
+            else:
+                is_match = (
+                    cur_artist.casefold() == artist_name.casefold()
+                    and (item_name or "").casefold() == cur_track.casefold()
+                )
+            if not is_match:
+                continue
+
+            uts = (t.get("date") or {}).get("uts")
+            if not uts:
+                continue
+            ts = int(uts)
+            if ts >= cutoff:
+                recent_count += 1
+            if first_ts is None or ts < first_ts:
+                first_ts = ts
+
+        attr = rt.get("@attr") or {}
+        total_pages_raw = attr.get("totalPages")
+        if total_pages_raw:
+            try:
+                if page >= int(total_pages_raw):
+                    break
+                if int(total_pages_raw) > max_pages:
+                    partial = True
+            except ValueError:
+                pass
+        page += 1
+
+    return recent_count, first_ts, partial
+
+def _print_stats_block(
+    lfm: LastfmClient,
+    user: str,
+    kind: str,
+    artist_name: str,
+    item_name: str | None,
+    lifetime_plays: str,
+    description: str,
+) -> None:
+    recent_plays, first_ts, partial = _entity_recent_and_first(lfm, user, kind, artist_name, item_name)
+    if description:
+        click.echo(description)
+    click.echo(f"{bold('Plays (lifetime):')} {lifetime_plays}")
+    click.echo(f"{bold('Plays (recent 30d):')} {recent_plays}")
+    if first_ts is None:
+        click.echo(f"{bold('Discovery:')} unknown")
+    else:
+        click.echo(
+            f"{bold('Discovery:')} {time.strftime('%Y-%m-%d', time.localtime(first_ts))} ({human_delta(first_ts)})"
+        )
+    if partial:
+        click.echo(f"{bold('Note:')} stats are partial (history scan limit reached).")
+
 @click.group(context_settings=dict(help_option_names=["-h", "--help"]))
 def main():
-    """legato - minimal Last.fm CLI (Linux-only)."""
+    """legato - minimal Last.fm CLI"""
     pass
 
 @main.command()
@@ -72,8 +292,23 @@ def setup(timeout: int):
             return
         time.sleep(2)
 
+@main.command()
+def disconnect():
+    """Disconnect local Last.fm session from legato."""
+    cfg = load_config()
+    old_user = cfg.get("username")
+    cfg.data.pop("lastfm_session_key", None)
+    cfg.data.pop("username", None)
+    save_config(cfg)
+    if old_user:
+        click.echo(f"Disconnected {old_user}")
+    else:
+        click.echo("No account was connected")
+
 def _current_track(user: str | None = None):
     lfm = make_client()
+    if user is None:
+        require_connected(lfm)
     rt = lfm.recent_tracks(user=user, limit=1)
     tracks = rt.get("track") or []
     if isinstance(tracks, dict):
@@ -110,6 +345,12 @@ def current(user: str | None):
     if (not ent["now_playing"]) and ent["ts"] is not None:
         click.echo(human_delta(ent["ts"]))
 
+@main.command("fm")
+@click.option("--user", default=None)
+def fm_alias(user: str | None):
+    """FMbot-style alias for `current`."""
+    current(user=user)
+
 @main.command()
 @click.option("-n", "--limit", default=10, show_default=True, type=int)
 @click.option("--user", default=None)
@@ -117,6 +358,8 @@ def recent(limit: int, user: str | None):
     """Show recent scrobbles."""
     limit = clamp(limit, 1, 50)
     lfm = make_client()
+    if user is None:
+        require_connected(lfm)
     u = user or lfm.username or ""
     click.echo(accent(f"Recent for {u}:"))
     rt = lfm.recent_tracks(user=u, limit=limit)
@@ -142,21 +385,48 @@ def top():
 
 def _period(p: str) -> str:
     p = p.strip().lower()
-    allowed = {"day","week","month","quarter","year","overall","d","w","m","q","y"}
+    allowed = {"day","week","month","quarter","year","overall","alltime","all","d","w","m","q","y","o"}
     if p not in allowed:
-        raise click.BadParameter("period must be day|week|month|quarter|year|overall")
-    return {"d":"day","w":"week","m":"month","q":"quarter","y":"year"}.get(p, p)
+        raise click.BadParameter("period must be day|week|month|quarter|year|overall|alltime|all")
+    return {
+        "d": "day",
+        "w": "week",
+        "m": "month",
+        "q": "quarter",
+        "y": "year",
+        "o": "overall",
+        "alltime": "overall",
+        "all": "overall",
+    }.get(p, p)
 
 @top.command("artist")
-@click.option("-p", "--period", default="week", show_default=True)
+@click.option(
+    "-p",
+    "--period",
+    "--time",
+    "--range",
+    default="week",
+    show_default=True,
+    help="Time period: day|week|month|quarter|year|overall|alltime|all (aliases: d|w|m|q|y|o)",
+)
 @click.option("-n", "--limit", default=10, show_default=True, type=int)
+@click.option("--year", "year_filter", default=None, type=int, help="Specific calendar year (e.g. 2024).")
 @click.option("--user", default=None)
-def top_artist(period: str, limit: int, user: str | None):
+def top_artist(period: str, limit: int, year_filter: int | None, user: str | None):
     """Top artists for a period."""
     period = _period(period)
     limit = clamp(limit, 1, 50)
     lfm = make_client()
+    if user is None:
+        require_connected(lfm)
     u = user or lfm.username or ""
+    if year_filter is not None:
+        click.echo(accent(f"Top artists ({year_filter}) for {u}:"))
+        rows = _top_for_year(lfm, u, "artist", year_filter, limit=limit)
+        for i, (name, _, plays) in enumerate(rows, start=1):
+            click.echo(f"{i}. {link(name, lastfm_artist_url(name))} ({_plays_text(plays)})")
+        return
+
     click.echo(accent(f"Top artists ({period}) for {u}:"))
     data = lfm.top_artists(u, period_to_lastfm(period), limit=limit)
     items = data.get("artist") or []
@@ -165,18 +435,36 @@ def top_artist(period: str, limit: int, user: str | None):
     for i, it in enumerate(items[:limit], start=1):
         name = it.get("name") or ""
         plays = it.get("playcount") or "0"
-        click.echo(f"{i}. {link(name, lastfm_artist_url(name))} ({plays})")
+        click.echo(f"{i}. {link(name, lastfm_artist_url(name))} ({_plays_text(plays)})")
 
 @top.command("album")
-@click.option("-p", "--period", default="week", show_default=True)
+@click.option(
+    "-p",
+    "--period",
+    "--time",
+    "--range",
+    default="week",
+    show_default=True,
+    help="Time period: day|week|month|quarter|year|overall|alltime|all (aliases: d|w|m|q|y|o)",
+)
 @click.option("-n", "--limit", default=10, show_default=True, type=int)
+@click.option("--year", "year_filter", default=None, type=int, help="Specific calendar year (e.g. 2024).")
 @click.option("--user", default=None)
-def top_album(period: str, limit: int, user: str | None):
+def top_album(period: str, limit: int, year_filter: int | None, user: str | None):
     """Top albums for a period."""
     period = _period(period)
     limit = clamp(limit, 1, 50)
     lfm = make_client()
+    if user is None:
+        require_connected(lfm)
     u = user or lfm.username or ""
+    if year_filter is not None:
+        click.echo(accent(f"Top albums ({year_filter}) for {u}:"))
+        rows = _top_for_year(lfm, u, "album", year_filter, limit=limit)
+        for i, (name, artist, plays) in enumerate(rows, start=1):
+            click.echo(f"{i}. {link(name, lastfm_album_url(artist, name))} — {link(artist, lastfm_artist_url(artist))} ({_plays_text(plays)})")
+        return
+
     click.echo(accent(f"Top albums ({period}) for {u}:"))
     data = lfm.top_albums(u, period_to_lastfm(period), limit=limit)
     items = data.get("album") or []
@@ -186,18 +474,36 @@ def top_album(period: str, limit: int, user: str | None):
         name = it.get("name") or ""
         artist = (it.get("artist") or {}).get("name") or ""
         plays = it.get("playcount") or "0"
-        click.echo(f"{i}. {link(name, lastfm_album_url(artist, name))} — {link(artist, lastfm_artist_url(artist))} ({plays})")
+        click.echo(f"{i}. {link(name, lastfm_album_url(artist, name))} — {link(artist, lastfm_artist_url(artist))} ({_plays_text(plays)})")
 
 @top.command("track")
-@click.option("-p", "--period", default="week", show_default=True)
+@click.option(
+    "-p",
+    "--period",
+    "--time",
+    "--range",
+    default="week",
+    show_default=True,
+    help="Time period: day|week|month|quarter|year|overall|alltime|all (aliases: d|w|m|q|y|o)",
+)
 @click.option("-n", "--limit", default=10, show_default=True, type=int)
+@click.option("--year", "year_filter", default=None, type=int, help="Specific calendar year (e.g. 2024).")
 @click.option("--user", default=None)
-def top_track(period: str, limit: int, user: str | None):
+def top_track(period: str, limit: int, year_filter: int | None, user: str | None):
     """Top tracks for a period."""
     period = _period(period)
     limit = clamp(limit, 1, 50)
     lfm = make_client()
+    if user is None:
+        require_connected(lfm)
     u = user or lfm.username or ""
+    if year_filter is not None:
+        click.echo(accent(f"Top tracks ({year_filter}) for {u}:"))
+        rows = _top_for_year(lfm, u, "track", year_filter, limit=limit)
+        for i, (name, artist, plays) in enumerate(rows, start=1):
+            click.echo(f"{i}. {link(name, lastfm_track_url(artist, name))} — {link(artist, lastfm_artist_url(artist))} ({_plays_text(plays)})")
+        return
+
     click.echo(accent(f"Top tracks ({period}) for {u}:"))
     data = lfm.top_tracks(u, period_to_lastfm(period), limit=limit)
     items = data.get("track") or []
@@ -207,15 +513,20 @@ def top_track(period: str, limit: int, user: str | None):
         name = it.get("name") or ""
         artist = (it.get("artist") or {}).get("name") or ""
         plays = it.get("playcount") or "0"
-        click.echo(f"{i}. {link(name, lastfm_track_url(artist, name))} — {link(artist, lastfm_artist_url(artist))} ({plays})")
+        click.echo(f"{i}. {link(name, lastfm_track_url(artist, name))} — {link(artist, lastfm_artist_url(artist))} ({_plays_text(plays)})")
 
 @main.command()
+@click.argument("query_arg", required=False)
 @click.option("--name", default=None)
 @click.option("--user", default=None)
-def artist(name: str | None, user: str | None):
-    """Artist info + user playcount."""
+def artist(query_arg: str | None, name: str | None, user: str | None):
+    """Artist lookup with plays, recent plays, discovery date, and Last.fm description."""
     lfm = make_client()
+    if user is None:
+        require_connected(lfm)
     u = user or lfm.username or ""
+    if query_arg:
+        name = name or query_arg
     if not name:
         ent = _current_track(user=u)
         name = ent["artist"]
@@ -223,17 +534,35 @@ def artist(name: str | None, user: str | None):
     url = info.get("url") or lastfm_artist_url(name)
     stats = info.get("stats") or {}
     overall = stats.get("userplaycount") or "0"
+    description = _entity_description("artist", info)
     click.echo(link(name, url))
-    click.echo(f"Plays (overall): {overall}")
+    _print_stats_block(
+        lfm=lfm,
+        user=u,
+        kind="artist",
+        artist_name=name,
+        item_name=None,
+        lifetime_plays=str(overall),
+        description=description,
+    )
 
 @main.command()
+@click.argument("query_arg", required=False)
 @click.option("--name", default=None)
 @click.option("--artist", "artist_name", default=None)
+@click.option("--query", default=None, help="Quoted pipe input: ARTIST | ALBUM")
 @click.option("--user", default=None)
-def album(name: str | None, artist_name: str | None, user: str | None):
-    """Album info + user playcount."""
+def album(query_arg: str | None, name: str | None, artist_name: str | None, query: str | None, user: str | None):
+    """Album lookup with plays, recent plays, discovery date, and Last.fm description."""
     lfm = make_client()
+    if user is None:
+        require_connected(lfm)
     u = user or lfm.username or ""
+    query_value = query_arg or query
+    if query_value:
+        q_artist, q_album = _split_csv(query_value, 2, 2, "album query")
+        artist_name = artist_name or q_artist
+        name = name or q_album
     if not name or not artist_name:
         ent = _current_track(user=u)
         name = name or ent["album"]
@@ -243,18 +572,36 @@ def album(name: str | None, artist_name: str | None, user: str | None):
     info = lfm.album_info(artist_name, name, username=u)
     url = info.get("url") or lastfm_album_url(artist_name, name)
     overall = info.get("userplaycount") or "0"
+    description = _entity_description("album", info)
     click.echo(link(name, url))
     click.echo(link(artist_name, lastfm_artist_url(artist_name)))
-    click.echo(f"Plays (overall): {overall}")
+    _print_stats_block(
+        lfm=lfm,
+        user=u,
+        kind="album",
+        artist_name=artist_name,
+        item_name=name,
+        lifetime_plays=str(overall),
+        description=description,
+    )
 
 @main.command()
+@click.argument("query_arg", required=False)
 @click.option("--name", default=None)
 @click.option("--artist", "artist_name", default=None)
+@click.option("--query", default=None, help="Quoted pipe input: ARTIST | TRACK")
 @click.option("--user", default=None)
-def track(name: str | None, artist_name: str | None, user: str | None):
-    """Track info + user playcount."""
+def track(query_arg: str | None, name: str | None, artist_name: str | None, query: str | None, user: str | None):
+    """Track lookup with plays, recent plays, discovery date, and Last.fm description."""
     lfm = make_client()
+    if user is None:
+        require_connected(lfm)
     u = user or lfm.username or ""
+    query_value = query_arg or query
+    if query_value:
+        q_artist, q_track = _split_csv(query_value, 2, 2, "track query")
+        artist_name = artist_name or q_artist
+        name = name or q_track
     if not name or not artist_name:
         ent = _current_track(user=u)
         name = name or ent["track"]
@@ -262,9 +609,73 @@ def track(name: str | None, artist_name: str | None, user: str | None):
     info = lfm.track_info(artist_name, name, username=u)
     url = info.get("url") or lastfm_track_url(artist_name, name)
     overall = info.get("userplaycount") or "0"
+    description = _entity_description("track", info)
     click.echo(link(name, url))
     click.echo(link(artist_name, lastfm_artist_url(artist_name)))
-    click.echo(f"Plays (overall): {overall}")
+    _print_stats_block(
+        lfm=lfm,
+        user=u,
+        kind="track",
+        artist_name=artist_name,
+        item_name=name,
+        lifetime_plays=str(overall),
+        description=description,
+    )
+
+@main.command()
+@click.option("--target", type=click.Choice(["artist", "album", "track"], case_sensitive=False), default="track", show_default=True)
+@click.option("--query", default=None, help="Quoted pipe input: ARTIST | ALBUM, ARTIST | TRACK, or ARTIST")
+@click.option("--name", default=None)
+@click.option("--artist", "artist_name", default=None)
+@click.option("--user", default=None)
+def plays(target: str, query: str | None, name: str | None, artist_name: str | None, user: str | None):
+    """FMbot-style playcount lookup for artist/album/track."""
+    lfm = make_client()
+    if user is None:
+        require_connected(lfm)
+    u = user or lfm.username or ""
+    target = target.lower()
+
+    if query:
+        if target == "artist":
+            q_artist = _split_csv(query, 1, 1, "--query")[0]
+            artist_name = artist_name or q_artist
+        else:
+            q_artist, q_name = _split_csv(query, 2, 2, "--query")
+            artist_name = artist_name or q_artist
+            name = name or q_name
+
+    if target == "artist":
+        if not artist_name:
+            ent = _current_track(user=u)
+            artist_name = ent["artist"]
+        info = lfm.artist_info(artist_name, username=u)
+        url = info.get("url") or lastfm_artist_url(artist_name)
+        plays_v = (info.get("stats") or {}).get("userplaycount") or "0"
+        click.echo(link(artist_name, url))
+        click.echo(f"Plays (overall): {plays_v}")
+        return
+
+    if not name or not artist_name:
+        ent = _current_track(user=u)
+        name = name or (ent["album"] if target == "album" else ent["track"])
+        artist_name = artist_name or ent["artist"]
+
+    if target == "album":
+        info = lfm.album_info(artist_name, name, username=u)
+        url = info.get("url") or lastfm_album_url(artist_name, name)
+        plays_v = info.get("userplaycount") or "0"
+        click.echo(link(name, url))
+        click.echo(link(artist_name, lastfm_artist_url(artist_name)))
+        click.echo(f"Plays (overall): {plays_v}")
+        return
+
+    info = lfm.track_info(artist_name, name, username=u)
+    url = info.get("url") or lastfm_track_url(artist_name, name)
+    plays_v = info.get("userplaycount") or "0"
+    click.echo(link(name, url))
+    click.echo(link(artist_name, lastfm_artist_url(artist_name)))
+    click.echo(f"Plays (overall): {plays_v}")
 
 @main.command()
 @click.argument("artist")
@@ -277,16 +688,26 @@ def np(artist: str, track: str, album: str | None):
     click.echo("OK")
 
 @main.command()
-@click.argument("artist")
-@click.argument("track")
+@click.argument("artist_or_csv")
+@click.argument("track", required=False)
 @click.option("--album", default=None)
 @click.option("--ts", default="now", show_default=True)
-def scrobble(artist: str, track: str, album: str | None, ts: str):
-    """Submit a scrobble."""
+def scrobble(artist_or_csv: str, track: str | None, album: str | None, ts: str):
+    """Submit a scrobble. Accepts ARTIST TRACK or "ARTIST | TRACK[ | ALBUM]" in quotes."""
+    if track is None:
+        parts = _split_csv(artist_or_csv, 2, 3, "scrobble input")
+        artist = parts[0]
+        track = parts[1]
+        if len(parts) == 3 and not album:
+            album = parts[2]
+    else:
+        artist = artist_or_csv
     timestamp = now_ts() if ts.strip().lower() == "now" else int(ts)
     lfm = make_client()
     lfm.scrobble(artist, track, timestamp=timestamp, album=album)
-    click.echo("OK")
+    click.echo(f"Scrobbled: {link(track, lastfm_track_url(artist, track))} — {link(artist, lastfm_artist_url(artist))}")
+    if album:
+        click.echo(f"Album: {link(album, lastfm_album_url(artist, album))}")
 
 @main.command()
 @click.argument("artist", required=False)
@@ -317,6 +738,8 @@ def unlove(artist: str | None, track: str | None):
 def profile(user: str | None):
     """User profile summary."""
     lfm = make_client()
+    if user is None:
+        require_connected(lfm)
     u = user or lfm.username or ""
     info = lfm.user_info(u)
     name = info.get("name") or u
@@ -335,6 +758,8 @@ def friends(user: str | None, limit: int):
     """List friends."""
     limit = clamp(limit, 1, 50)
     lfm = make_client()
+    if user is None:
+        require_connected(lfm)
     u = user or lfm.username or ""
     click.echo(accent(f"Friends for {u}:"))
     data = lfm.friends(u, limit=limit, recenttracks=False)
@@ -347,12 +772,21 @@ def friends(user: str | None, limit: int):
 
 @main.command()
 @click.option("-i", "--increment", default=5000, show_default=True, type=int)
-@click.option("-p", "--period", default="month", show_default=True)
+@click.option(
+    "-p",
+    "--period",
+    "--time",
+    "--range",
+    default="month",
+    show_default=True,
+    help="Time period: day|week|month|quarter|year|overall|alltime|all (aliases: d|w|m|q|y|o)",
+)
 def pace(increment: int, period: str):
     """Estimate when you'll hit next milestone based on recent rate."""
     period = _period(period)
     days = {"day":1,"week":7,"month":30,"quarter":90,"year":365,"overall":30}.get(period, 30)
     lfm = make_client()
+    require_connected(lfm)
     info = lfm.user_info()
     total = int(info.get("playcount") or 0)
     next_target = ((total // increment) + 1) * increment
@@ -363,7 +797,9 @@ def pace(increment: int, period: str):
     page = 1
     seen_old = False
     while page <= 20 and not seen_old:
-        rt = lfm.recent_tracks(limit=200, page=page)
+        rt = _recent_tracks_page(lfm, user=None, limit=200, page=page)
+        if rt is None:
+            break
         tracks = rt.get("track") or []
         if isinstance(tracks, dict):
             tracks = [tracks]
@@ -409,9 +845,126 @@ def yt(artist: str | None, track: str | None, open_: bool):
         except Exception:
             pass
 
+@main.command()
+@click.option("--artist", "artist_name", default=None, help="Filter artist name.")
+@click.option("--track", "track_name", default=None, help="Filter track name (optionally with --artist).")
+@click.option("--query", default=None, help="Quoted pipe input: ARTIST or ARTIST | TRACK")
+@click.option("--user", default=None)
+@click.option("--max-pages", default=200, show_default=True, type=int)
+def first(artist_name: str | None, track_name: str | None, query: str | None, user: str | None, max_pages: int):
+    """FMbot-style first scrobble lookup."""
+    lfm = make_client()
+    if user is None:
+        require_connected(lfm)
+    u = user or lfm.username or ""
+    max_pages = clamp(max_pages, 1, 500)
+
+    if query:
+        q_parts = _split_csv(query, 1, 2, "--query")
+        artist_name = artist_name or q_parts[0]
+        if len(q_parts) == 2:
+            track_name = track_name or q_parts[1]
+
+    if not artist_name and not track_name:
+        ent = _current_track(user=u)
+        artist_name, track_name = ent["artist"], ent["track"]
+
+    page = 1
+    latest_match = None
+    while page <= max_pages:
+        rt = _recent_tracks_page(lfm, user=u, limit=200, page=page)
+        if rt is None:
+            break
+        tracks = _listify(rt.get("track"))
+        if not tracks:
+            break
+
+        for t in tracks:
+            if str((t.get("@attr") or {}).get("nowplaying", "")).lower() == "true":
+                continue
+            cur_artist = (t.get("artist") or {}).get("name") or (t.get("artist") or {}).get("#text") or ""
+            cur_track = t.get("name") or ""
+            if artist_name and cur_artist.casefold() != artist_name.casefold():
+                continue
+            if track_name and cur_track.casefold() != track_name.casefold():
+                continue
+            uts = (t.get("date") or {}).get("uts")
+            if not uts:
+                continue
+            latest_match = {
+                "artist": cur_artist,
+                "track": cur_track,
+                "url": t.get("url") or lastfm_track_url(cur_artist, cur_track),
+                "ts": int(uts),
+            }
+
+        attr = rt.get("@attr") or {}
+        total_pages_raw = attr.get("totalPages")
+        if total_pages_raw:
+            try:
+                if page >= int(total_pages_raw):
+                    break
+            except ValueError:
+                pass
+        page += 1
+
+    if not latest_match:
+        fatal("No matching scrobbles found.")
+
+    click.echo(accent(f"First scrobble for {u}:"))
+    click.echo(link(latest_match["track"], latest_match["url"]))
+    click.echo(link(latest_match["artist"], lastfm_artist_url(latest_match["artist"])))
+    click.echo(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(latest_match["ts"])))
+
+@main.command()
+@click.argument("other_user")
+@click.option("--user", default=None, help="Base user (defaults to connected account).")
+@click.option(
+    "-p",
+    "--period",
+    "--time",
+    "--range",
+    default="overall",
+    show_default=True,
+    help="Time period: day|week|month|quarter|year|overall|alltime|all (aliases: d|w|m|q|y|o)",
+)
+@click.option("-n", "--limit", default=100, show_default=True, type=int)
+def taste(other_user: str, user: str | None, period: str, limit: int):
+    """FMbot-style taste comparison using shared top artists."""
+    period = _period(period)
+    limit = clamp(limit, 10, 500)
+    lfm = make_client()
+    if user is None:
+        require_connected(lfm)
+    base_user = user or lfm.username or ""
+
+    left = _listify(lfm.top_artists(base_user, period_to_lastfm(period), limit=limit).get("artist"))
+    right = _listify(lfm.top_artists(other_user, period_to_lastfm(period), limit=limit).get("artist"))
+
+    left_map = {str(it.get("name") or ""): int(it.get("playcount") or 0) for it in left if it.get("name")}
+    right_map = {str(it.get("name") or ""): int(it.get("playcount") or 0) for it in right if it.get("name")}
+    shared = [name for name in left_map.keys() if name in right_map]
+
+    overlap_num = sum(min(left_map[n], right_map[n]) for n in shared)
+    overlap_den = sum(max(left_map.get(n, 0), right_map.get(n, 0)) for n in set(left_map) | set(right_map))
+    score = (100.0 * overlap_num / overlap_den) if overlap_den else 0.0
+
+    click.echo(accent(f"Taste: {base_user} vs {other_user} ({period})"))
+    click.echo(f"Compatibility: {score:.1f}%")
+    click.echo(f"Shared artists: {len(shared)}")
+
+    if not shared:
+        return
+    ranked = sorted(shared, key=lambda n: min(left_map[n], right_map[n]), reverse=True)[:10]
+    for i, name in enumerate(ranked, start=1):
+        click.echo(f"{i}. {link(name, lastfm_artist_url(name))} ({left_map[name]} / {right_map[name]})")
+
 @main.group()
 def theme():
-    """Theme / accent color."""
+    """Theme / accent color.
+
+    Named colors: red, bright_red, orange, yellow, green, blue, magenta, cyan, white.
+    """
     pass
 
 @theme.command("show")
@@ -420,8 +973,13 @@ def theme_show():
     click.echo(f"accent_sgr={t.accent}")
 
 @theme.command("set")
-@click.argument("color")
+@click.argument("color", metavar=f"COLOR ({THEME_COLOR_NAMES}|SGR)")
 def theme_set(color: str):
+    """Set accent color.
+
+    COLOR can be one of: red, bright_red, orange, yellow, green, blue, magenta, cyan, white
+    or an SGR code like: 1;91
+    """
     try:
         t = set_accent(color)
     except Exception as e:
