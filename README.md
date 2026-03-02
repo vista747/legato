@@ -6,7 +6,7 @@ A minimal terminal client for Last.fm.
 ```bash
 python3 -m pip install --user pipx
 pipx ensurepath
-pipx install legato
+pipx install legato-fm
 ```
 
 ## Setup
