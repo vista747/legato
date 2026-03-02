@@ -1,2 +1,8 @@
+from importlib.metadata import PackageNotFoundError, version
+
 __all__ = ["__version__"]
-__version__ = "0.4.0"
+
+try:
+	__version__ = version("legato-fm")
+except PackageNotFoundError:
+	__version__ = "0.0.0"

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "legato-fm"
-version = "1.0.1"
+version = "1.0.2"
 description = "Linux-first terminal Last.fm client (minimal output)"
 readme = "README.md"
 license = "MIT"

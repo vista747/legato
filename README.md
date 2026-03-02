@@ -1,11 +1,10 @@
-# legato (Linux-only)
+# legato
 
 A minimal terminal client for Last.fm.
 
 ## Install (recommended)
 ```bash
 python3 -m pip install --user pipx
-pipx ensurepath
 pipx install legato-fm
 ```
 
@@ -30,6 +29,7 @@ Edit:
 - `src/legato/lastfm.py` -> `APP_API_KEY` and `APP_API_SECRET`
 
 ## Commands
+- `legato --version`
 - `legato current` (now playing / last scrobble)
 - `legato fm` (FMbot-style alias for current)
 - `legato disconnect` (remove saved session + username from local config)

@@ -13,6 +13,32 @@ APP_API_SECRET = "d1372ddd649e1c25526b10ab38ea30fa"
 class LastfmError(RuntimeError):
     pass
 
+def _query_target(params: Dict[str, str]) -> str:
+    user = str(params.get("user") or "").strip()
+    artist = str(params.get("artist") or "").strip()
+    album = str(params.get("album") or "").strip()
+    track = str(params.get("track") or "").strip()
+
+    if user:
+        return user
+    if artist and track:
+        return f"{artist} - {track}"
+    if artist and album:
+        return f"{artist} - {album}"
+    if artist:
+        return artist
+    if track:
+        return track
+    if album:
+        return album
+    return str(params.get("method") or "request")
+
+def _is_not_found_error(error_code: Any, message: str) -> bool:
+    message_lc = (message or "").casefold()
+    if "not found" in message_lc or "no results" in message_lc:
+        return True
+    return str(error_code) in {"6"}
+
 def _md5(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()
 
@@ -32,6 +58,7 @@ class LastfmClient:
         p = dict(params)
         p["api_key"] = self.api_key
         p["format"] = "json"
+        target = _query_target(params)
         if signed:
             sig_params = {k: str(v) for k, v in p.items() if k != "format"}
             p["api_sig"] = api_sig(sig_params, self.api_secret)
@@ -43,10 +70,18 @@ class LastfmClient:
                     r = client.get(API_ROOT, params=p)
             r.raise_for_status()
             data = r.json()
+        except httpx.HTTPStatusError as e:
+            if e.response is not None and e.response.status_code == 404:
+                raise LastfmError(f"{target} returned no results") from e
+            raise LastfmError(f"HTTP error: {e}") from e
         except Exception as e:
             raise LastfmError(f"HTTP error: {e}") from e
         if isinstance(data, dict) and "error" in data:
-            raise LastfmError(f"Last.fm error {data.get('error')}: {data.get('message')}")
+            error_code = data.get("error")
+            error_message = str(data.get("message") or "")
+            if _is_not_found_error(error_code, error_message):
+                raise LastfmError(f"{target} returned no results")
+            raise LastfmError(f"Last.fm error {error_code}: {error_message}")
         return data
 
     def get_token(self) -> str:
