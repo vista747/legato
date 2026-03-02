@@ -59,7 +59,7 @@ class LastfmClient:
 
     # ---- Auth ----
     def get_token(self) -> str:
-        data = self._request("GET", {"method": "auth.getToken"}, signed=True)
+        data = self._request("GET", {"method": "auth.getToken"}, signed=False)
         tok = data.get("token")
         if not tok:
             raise LastfmError("No token returned.")
@@ -81,6 +81,26 @@ class LastfmClient:
         self.session_key = sk
         self.username = name
         return sk, name
+    
+    def try_get_session(self, token: str) -> tuple[str, str] | None:
+        """Return (session_key, username) if authorized; otherwise None."""
+        try:
+            data = self._request(
+                "GET",
+                {"method": "auth.getSession", "token": token},
+                signed=True,
+            )
+            sess = data.get("session") or {}
+            sk = sess.get("key")
+            name = sess.get("name")
+            if sk and name:
+                self.session_key = sk
+                self.username = name
+                return sk, name
+            return None
+        except LastfmError:
+            # Before authorization, Last.fm returns an API error. Treat as "not yet".
+            return None
 
     # ---- User ----
     def user_info(self, user: str | None = None) -> Dict[str, Any]:
