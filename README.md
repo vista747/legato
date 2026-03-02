@@ -1,4 +1,4 @@
-# legato
+# legato v1.0.2
 
 A minimal terminal client for Last.fm.
 
