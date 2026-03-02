@@ -1,4 +1,4 @@
-# legato v1.0.2
+# legato v1.0.3
 
 A minimal terminal client for Last.fm.
 
@@ -16,17 +16,9 @@ Session keys are long-lived unless the user revokes your app in Last.fm settings
 legato setup
 ```
 
-## Output style
-No bordered tables. Plain text. Links are terminal hyperlinks (OSC 8) where supported.
-
 ## YouTube
 `legato yt` prints a YouTube search link for the current track and notes that a smarter matcher is coming soon.
 
-## App credentials (important)
-Last.fm requires an **API key + shared secret for your application** (not the user). You must set these before release.
-
-Edit:
-- `src/legato/lastfm.py` -> `APP_API_KEY` and `APP_API_SECRET`
 
 ## Commands
 - `legato --version`
@@ -57,31 +49,6 @@ Edit:
 - `legato doctor`
 - `legato api METHOD [key=value ...]` (power-user escape hatch; read methods only unless --write)
 
-## Notes
-Legato aims to cover the core Last.fm functionality exposed by the official API (recent, now playing, scrobble, top, info, love/unlove, profile, friends).
-Discord-server-only features are intentionally omitted.
-
-## Publish to PyPI (GitHub Actions)
-
-This repo includes [publish workflow](.github/workflows/publish-pypi.yml) that:
-- builds package artifacts,
-- runs `twine check`,
-- publishes to PyPI when you push a tag like `v0.5.0`.
-
-### One-time setup
-1. Create a PyPI API token (scope it to this project).
-2. In GitHub: **Settings → Secrets and variables → Actions → New repository secret**.
-3. Add secret name: `PYPI_API_TOKEN`, value: your token.
-
-### Release flow
-1. Bump version in `pyproject.toml`.
-2. Commit and push.
-3. Create and push a tag:
-
-```bash
-git tag v0.5.0
-git push origin v0.5.0
-```
 
 4. Watch Actions run; after success users can install/update with:
 
