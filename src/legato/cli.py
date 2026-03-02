@@ -337,10 +337,7 @@ def _current_track(user: str | None = None):
             ts = int(uts)
     return {"artist": artist, "track": track, "album": album, "url": url, "now_playing": now_playing, "ts": ts, "user": user or lfm.username or ""}
 
-@main.command()
-@click.option("--user", default=None)
-def current(user: str | None):
-    """Show now playing or most recent track."""
+def _show_current(user: str | None = None) -> None:
     ent = _current_track(user=user)
     u = ent["user"] or user or ""
     click.echo(accent(f"Now playing for {u}:") if ent["now_playing"] else accent(f"Last played for {u}:"))
@@ -354,11 +351,17 @@ def current(user: str | None):
     if (not ent["now_playing"]) and ent["ts"] is not None:
         click.echo(human_delta(ent["ts"]))
 
+@main.command()
+@click.option("--user", default=None)
+def current(user: str | None):
+    """Show now playing or most recent track."""
+    _show_current(user=user)
+
 @main.command("fm")
 @click.option("--user", default=None)
 def fm_alias(user: str | None):
     """FMbot-style alias for `current`."""
-    current(user=user)
+    _show_current(user=user)
 
 @main.command()
 @click.option("-n", "--limit", default=10, show_default=True, type=int)
