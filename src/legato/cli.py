@@ -10,6 +10,7 @@ from .lastfm import LastfmClient, LastfmError, validate_app_creds, period_to_las
 from .utils import now_ts, human_delta, clamp, lastfm_user_url, lastfm_artist_url, lastfm_album_url, lastfm_track_url, youtube_search_url
 from .ansi import hyperlink, sgr, reset
 from .theme import get_theme, set_accent, NAMED
+from . import __version__
 
 THEME_COLOR_NAMES = ", ".join(NAMED.keys())
 
@@ -254,6 +255,14 @@ def _print_stats_block(
         click.echo(f"{bold('Note:')} stats are partial (history scan limit reached).")
 
 @click.group(context_settings=dict(help_option_names=["-h", "--help"]))
+@click.option(
+    "--version",
+    is_flag=True,
+    is_eager=True,
+    expose_value=False,
+    callback=lambda ctx, param, value: (click.echo(f"legato, version {__version__}"), ctx.exit()) if value and not ctx.resilient_parsing else None,
+    help="Show version and exit.",
+)
 def main():
     """legato - minimal Last.fm CLI"""
     pass

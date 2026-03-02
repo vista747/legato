@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "legato-fm"
-version = "1.0.2"
-description = "Linux-first terminal Last.fm client (minimal output)"
+version = "1.0.3"
+description = "Linux-first terminal Last.fm client"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
-authors = [{name = "Julius"}]
+authors = [{name = "vista747"}]
 keywords = ["lastfm", "cli", "music", "terminal", "scrobble"]
 classifiers = [
   "Development Status :: 4 - Beta",
